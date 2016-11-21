@@ -1,0 +1,232 @@
+---
+title: "What's Cooking?"
+author: "Brooke Fitzgerald"
+date: "10/25/2015"
+output: pdf_document
+---
+
+```{r, echo=FALSE,message=FALSE, warning=FALSE, tidy=TRUE}
+library(jsonlite)
+library(ggplot2)
+library(rpart)
+library(rpart.plot)
+library(tm)
+library(circlize)
+library("e1071")
+library(caret)
+library(RColorBrewer)
+library(plyr)
+library(iterators)
+library(wordcloud)
+require('MASS')
+library(knitr)
+opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE)
+########Top-Level########
+
+train <- fromJSON('train.json',flatten = TRUE)
+```
+
+In this project I analyzed data from Kaggle's data competition "What's Cooking?" containing recipes, their ingredients, and their cuisines. First thing's first, I downloaded the training data set, transformed it into a document term matrix, and did some data pre-processing with the tm package. I removed the punctuation, ensured that all of the ingredients were lowercase, removed common English words, stemmed all of the words, and removed sparse terms. 
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+#textual preprocessing
+ingredients <- Corpus(VectorSource(train$ingredients))
+ingredients <- tm_map(ingredients, removePunctuation)
+ingredients <- tm_map(ingredients, content_transformer(tolower))
+ingredients <- tm_map(ingredients, removeWords, stopwords('english'))
+ingredients <- tm_map(ingredients, stemDocument)
+
+dtm <- DocumentTermMatrix(ingredients)
+sparsedtm <- removeSparseTerms(dtm, 0.99)
+ingredientsDTM <- as.data.frame(as.matrix(sparsedtm))
+```
+
+Then I wanted to examine the frequency and distribution of the different ingredients across the data set both with a bar plot and a word cloud of the ingredient frequencies. I also looked at the recipe distribution by cuisine.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+
+#Barplot
+ingredientFreq <- sort(colSums(ingredientsDTM), decreasing = TRUE)
+ingredientNames <- names(ingredientFreq)
+barplot(ingredientFreq, cex.names = 0.5)
+
+#Wordcloud
+wordcloud(ingredients, max.words = 200, random.order=FALSE, colors=brewer.pal(8, 'Dark2'))
+
+# Add the dependent variable to the data.frame
+ingredientsDTM$cuisine <- as.factor(train$cuisine)
+histogram(ingredientsDTM$cuisine,scales = list(cex = 0.5), xlab = 'Cuisine')
+```
+
+After seeing how the different ingredients were distributed, I decided to look more at cuisine and what it does to the data. I created another document term matrix that has less ingredients and is thus better for broad visualization. I then split that data by cuisine and manipulated the data to see what percent of the recipes for each cuisine contain a particular ingredient. I then added up all of those percents for each cuisine and got an estimate of how many ingredients are used in each cuisine's average recipes.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+#remove some ingredients to have a more maneagable size for visualization
+moreSparseDTM<-removeSparseTerms(dtm, 0.935)
+smalldtm<-  as.data.frame(as.matrix(moreSparseDTM))
+smalldtm$cuisine <- as.factor(train$cuisine)
+splitIngredients <- split(smalldtm, smalldtm$cuisine)
+#since all of the cuisines have the same ingredients, deleting the last row of any cuisine will give you the ingredient names
+ingredientNames<-names(splitIngredients$brazilian)
+length(ingredientNames)<-(length(ingredientNames)-1)
+
+row.data<-c()
+
+for (cuisine in splitIngredients) {
+  #remove the cuisine column at the end
+  woCuisine<- cuisine[,-(ncol(cuisine))]
+  #add the column (ingredient) names back in
+  names(woCuisine)<-ingredientNames
+  #sum the column which will give you the number of times the ingredient was used per cuisine
+  ingPerCuisine<-colSums(woCuisine)
+  #dividing the columns by the number of recipes gives you an estimate of how many ingredients are used in each cuisine's average recipes.
+  ingPerCuisine<-ingPerCuisine/nrow(woCuisine)
+  row.data<-c(row.data,ingPerCuisine)
+  }
+
+ingPerCuisine.matrix<-rbind(row.data[1:90],row.data[91:180],row.data[181:270],row.data[271:360],
+                   row.data[361:450],row.data[451:540],row.data[541:630],row.data[631:720],
+                   row.data[721:810],row.data[811:900],row.data[901:990],row.data[991:1080],
+                   row.data[1081:1170],row.data[1171:1260],row.data[1261:1350],row.data[1351:1440],
+                   row.data[1441:1530],row.data[1531:1620],row.data[1621:1710],row.data[1711:1800])
+rownames(ingPerCuisine.matrix)<-names(splitIngredients)
+ingPerCuisine.matrix[1:3,1:10]
+ingredientsPerRecipe<-rowSums(ingPerCuisine.matrix)
+par(las=2)
+par(mar=c(5,8,4,2))
+barplot(ingredientsPerRecipe, xlab = 'Cuisines', cex.names = .5, main='Average Ingredients Per Recipe')
+
+```
+
+After that, I wanted to create a decision tree that would predict the cuisine of a recipe based on it's ingredients. To do this, I split up my data into a training and test set, and made a model with the training data. I then created a rpart decision tree model and ran it on my test set data. I then qualified my results with a confusion matrix.
+
+```{r message=FALSE, warning=FALSE, tidy=TRUE}
+#######   Decision Tree    #######
+inTrain <- createDataPartition(y = ingredientsDTM$cuisine, p = 0.6, list = FALSE)
+training <- ingredientsDTM[inTrain,]
+testing <- ingredientsDTM[-inTrain,]
+
+treemodel <- rpart(cuisine ~ ., data=training, method = 'class')
+prp(treemodel)
+
+#Predict using the decision tree
+prediction <- predict(treemodel, newdata=testing, type='class')
+
+#confusion matrix
+CM <- confusionMatrix(prediction, testing$cuisine)
+CM
+```
+
+As you can see, my accuracy rate is fairly low at 40% overall accuracy. However, my model preforms 8 times better than pure chance and a little over twice as well as just predicting every recipe as Italian.
+
+I then decided to implement the relationships between diﬀerent ingredients and their respective cuisines. The ﬁrst step I took was to create a function that when given a list of recipes in the form of a document term matrix would return an covariance matrix.
+
+```{r}
+ingredientCheckBoolean<-function(recipe){
+      ingBoolean<- c() 
+      for (i in 1:length(recipe)){ 
+            if (recipe[i]==1){
+                  ingBoolean<-c(ingBoolean, TRUE)
+                  } 
+            else{
+                  ingBoolean<-c(ingBoolean, FALSE)
+                  }
+      }
+      return(ingBoolean)
+}
+createIngredientMatrix<-function(groupOfRecipes,blankMatrix){
+      #remove the cuisine column at the end
+      woCuisine<- groupOfRecipes[,-(ncol(groupOfRecipes))]
+      names(woCuisine)<-smallIngredientNames 
+      #breaking up data by rows
+      my.iterator<- iter(woCuisine, by='row')
+      for (i in 1:nrow(woCuisine)){
+            recipe<-nextElem(my.iterator)
+            blankMatrix[ingredientCheckBoolean(recipe),ingredientCheckBoolean(recipe)]<-
+                  blankMatrix[ingredientCheckBoolean(recipe),ingredientCheckBoolean(recipe) ]+1
+      }
+      return(blankMatrix)
+}
+```
+
+I then split my data by cuisine to get a list of the ingredient names, created an empty ingredient matrix and then ﬁlled it with the all of the data from my sparsed document term matrix.
+
+```{r}
+smallIngredientNames<-names(smalldtm) 
+smallIngredientNames<- smallIngredientNames[-length(smallIngredientNames)]
+
+m <- data.frame(matrix(0, ncol = length(smallIngredientNames), nrow = length(smallIngredientNames)), row.names = smallIngredientNames)
+names(m)<-smallIngredientNames
+                
+assocMatrix <- createIngredientMatrix(smalldtm,m)
+```
+
+After much wrangling, I managed to ﬁgure out how to represent that matrix in a cicle graph.
+
+```{r}
+circos.par(cell.padding = c(0.02, 0, 0.02, 0))
+chordDiagramFromMatrix(as.matrix(assocMatrix))
+```
+
+
+However, as you can see, there are so many recipes and ingredients that the graph is really hard to read. Thus, I decided to partition my data into a smaller subset of 50 recipes for readability.
+
+```{r}
+subset<-smalldtm[sample(1:nrow(smalldtm),50),]
+
+assocMatrix <- createIngredientMatrix(subset,m)
+
+chordDiagramFromMatrix(as.matrix(assocMatrix))
+```
+
+I then made circle graphs for other cuisines!
+
+##British
+
+```{r}
+subset<-splitIngredients$british[sample(1:nrow(splitIngredients$british),50),]
+
+assocMatrix <- createIngredientMatrix(subset,m)
+
+chordDiagramFromMatrix(as.matrix(assocMatrix))
+```
+
+##Italian
+
+```{r}
+subset<-splitIngredients$italian[sample(1:nrow(splitIngredients$italian),50),]
+
+assocMatrix <- createIngredientMatrix(subset,m)
+
+chordDiagramFromMatrix(as.matrix(assocMatrix))
+```
+
+##Indian
+
+```{r}
+subset<-splitIngredients$indian[sample(1:nrow(splitIngredients$indian),50),]
+
+assocMatrix <- createIngredientMatrix(subset,m)
+
+chordDiagramFromMatrix(as.matrix(assocMatrix))
+```
+
+##Chinese
+
+```{r}
+subset<-splitIngredients$chinese[sample(1:nrow(splitIngredients$chinese),50),]
+
+assocMatrix <- createIngredientMatrix(subset,m)
+
+chordDiagramFromMatrix(as.matrix(assocMatrix))
+```
+
+##Mexican
+
+```{r}
+subset<-splitIngredients$mexican[sample(1:nrow(splitIngredients$mexican),50),]
+
+assocMatrix <- createIngredientMatrix(subset,m)
+
+chordDiagramFromMatrix(as.matrix(assocMatrix))
+```
