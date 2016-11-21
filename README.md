@@ -1,2 +1,2 @@
 # recipe_visualization
-A visual exploration of recipe data. 
+A visual exploration of recipe data using R. 
